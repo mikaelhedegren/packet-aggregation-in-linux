@@ -26,7 +26,7 @@
 
 #define TRUE 1
 #define FALSE 0
-#define KAUPROCSTR "Aggregated packeges: %d\nMetapackets sent: %d\nUnaggregated packets: %d\nAggragated bytes: %d\nAggregated bytes on network:%d\nUnaggregated bytes: %d\nPackages sent due to timeout: %d\nTime: %d\n"
+#define KAUPROCSTR "Aggregated packets: %d\nMetapackets sent: %d\nUnaggregated packets: %d\nAggragated bytes: %d\nAggregated bytes on network:%d\nUnaggregated bytes: %d\nPackages sent due to timeout: %d\nTime: %u\n"
 
 struct aggregation_statistics agg_stat;
 struct proc_dir_entry *kau_proc_file; //proc_fs file for statistics	
@@ -149,22 +149,32 @@ void mark_update(struct agg_queue* head)
 	head->maxSize = skb->mark >> 2;
 }
 
-struct agg_queue* getDequeue(struct agg_queue* head, unsigned int min_aggregation, unsigned int do_mark_update)
-{
+struct agg_queue* getDequeue(struct agg_queue* head, unsigned int min_aggregation, unsigned int do_mark_update, struct qdisc_watchdog *watchdog)
+{  	
 	struct agg_queue *curr = head;
 
-	struct agg_queue *old = NULL, *size = head;
+	struct agg_queue *old = NULL, *size = head, *kinda_old = NULL;
 
 	psched_time_t max_timeout = psched_get_time(); //Get current time!
 
 	if(head == NULL)
 		goto exit;
+
+	/*
+		Note:
+			old is used to select the oldest packet avalible, IF it is old enough to be considered
+			for aggregation at all.
+			kinda_old is used to hold the oldest queue, even if it's not old enough for sending.
+			kinda old is used to set up watchdog timer, old is returned and sent if one is found.
+	*/
 nextItem:
 	if(curr->timestamp <= max_timeout) //If something is old...
 		if(old == NULL || old->timestamp < curr->timestamp) //if it's also older than the current oldest
 			old = curr; //it's WAY old
 	if(size->currSize < curr->currSize)
 		size = curr;	//Make sure we have the largest pkt
+	if(kinda_old == NULL || kinda_old->timestamp < curr->timestamp) //if it's also older than the current oldest
+			kinda_old = curr; //it's the oldest so far
 	if(curr->next == NULL)
 		goto exit;
 
@@ -182,7 +192,10 @@ exit:
         return old;
     }
 	else if (size && do_mark_update) mark_update(size);
-	return(size->currSize > min_aggregation)? size : NULL;
+	if(size->currSize > min_aggregation)
+		return size;
+	qdisc_watchdog_schedule(watchdog, kinda_old->timestamp);
+	return NULL;
 }
 
 void agg_destroy(struct agg_queue** head)
@@ -211,11 +224,10 @@ exit:
 
 struct aggregate_sched_data
 {
-
+	struct qdisc_watchdog watchdog;
     unsigned int       	agg_min_size; 
 	unsigned int		agg_max_size;
 	unsigned int		agg_max_timeout;
-	unsigned char       stat;
 	struct agg_queue	*agg_queue_hdr;
 	
 };
@@ -252,10 +264,18 @@ static int agg_init(struct Qdisc *sch,struct rtattr *opt)
 {
     struct aggregate_sched_data *q = qdisc_priv(sch);
 	int ret = 0;
-	
+	qdisc_watchdog_init(&q->watchdog, sch);
+
     agg_stat_init(&agg_stat);	
 	ret = aggregate_change(sch,opt);
     q->agg_queue_hdr = NULL;
+	
+	sch->qstats.backlog = 0; 
+	sch->q.qlen = 0;
+/*	
+	sch->bstats.bytes = 0; 
+	sch->bstats.packets= 0;
+*/
     return ret;
 }
 
@@ -310,7 +330,10 @@ static int aggregate_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 			add(q->agg_queue_hdr,node); //Add it to the end of our agglist
 		}  
     }
-
+	sch->q.qlen++;
+	sch->qstats.backlog += skb->len;
+	sch->bstats.bytes += skb->len;
+	sch->bstats.packets++;
     return NET_XMIT_SUCCESS;
 }
 
@@ -318,14 +341,14 @@ static int procfile_read(char *buffer,
               char **buffer_location,
               off_t offset, int buffer_length, int *eof, void *data)
 {
-        int ret=0;
-          if (offset > 0) {
+    int ret=0;
+	unsigned int timediff = (unsigned int)( (unsigned int) ( (unsigned long)psched_get_time() - (unsigned long) agg_stat.starttime ) / (unsigned int) 1000000 );
+    if (offset > 0) {
           /* we have finished to read, return 0 */
           ret = 0;
   } else {
           /* fill the buffer, return the buffer size */
-          ret = sprintf(buffer,KAUPROCSTR,agg_stat.aggpackets,agg_stat.metaaggpkt,agg_stat.unaggpkt,agg_stat.aggbytes,agg_stat.aggtotbytes,agg_stat.unaggbytes,agg_stat.aggdelayed,(int)(psched_get_time()-agg_stat.starttime));
-         
+          ret = sprintf(buffer,KAUPROCSTR,agg_stat.aggpackets,agg_stat.metaaggpkt,agg_stat.unaggpkt,agg_stat.aggbytes,agg_stat.aggtotbytes,agg_stat.unaggbytes,agg_stat.aggdelayed, timediff);
   }
   return ret;
 }
@@ -346,7 +369,7 @@ static struct sk_buff *aggregate_dequeue(struct Qdisc *sch)
     if(q->agg_queue_hdr == NULL)
 		return NULL; //queue isn't initialized so there's nothing to dequeue
    
-    node = getDequeue(q->agg_queue_hdr, q->agg_min_size, (q->agg_max_size ? 0 : 1));    	
+    node = getDequeue(q->agg_queue_hdr, q->agg_min_size, (q->agg_max_size ? 0 : 1), &q->watchdog);    	
     if(node == NULL){
 		return NULL; //getDequeue doesn't feel there's anything to dequeue;
 	}
@@ -355,16 +378,20 @@ static struct sk_buff *aggregate_dequeue(struct Qdisc *sch)
         skb = __skb_dequeue(&node->skb_head);
 		if(skb == NULL) 
 			return NULL;
-	    if(likely(q->stat)){
-            agg_stat.unaggpkt++;
-            agg_stat.unaggbytes += skb->len;
-            }
+		sch->q.qlen--;
+		sch->qstats.backlog -= skb->len; 
+		
+	    agg_stat.unaggpkt++;
+        agg_stat.unaggbytes += skb->len;
     }
     else{
         temp = __skb_dequeue(&node->skb_head); 
 
 		if(temp == NULL) //Technically, this shouldn't happen!
 			return NULL;
+
+		sch->q.qlen--;
+		sch->qstats.backlog -= temp->len; 
 
 		if(node->currSize + MAC_LENGTH > node->maxSize)
 			max_size = node->maxSize;
@@ -379,11 +406,9 @@ static struct sk_buff *aggregate_dequeue(struct Qdisc *sch)
 			skb = temp;
 	
 			/* STATS */
-			if(likely(q->stat)){
-                agg_stat.unaggpkt++;
-                agg_stat.unaggbytes += skb->len;
-            }
-
+			agg_stat.unaggpkt++;
+            agg_stat.unaggbytes += skb->len;
+            
 			goto leave; //leave current scope
 		}
 		kfree_skb(temp);  //Remove the old skb(temp), we're keeping it in skb now
@@ -394,11 +419,9 @@ static struct sk_buff *aggregate_dequeue(struct Qdisc *sch)
 		if(iphead == NULL){
 
 			/* STATS */
-			if(likely(q->stat)){
-                agg_stat.unaggpkt++;
-                agg_stat.unaggbytes += skb->len;
-            }
-
+			agg_stat.unaggpkt++;
+            agg_stat.unaggbytes += skb->len;
+            
 			goto leave; //If we can't get the ipheader, we're sending the SKB as-is
 		}
 
@@ -427,12 +450,11 @@ static struct sk_buff *aggregate_dequeue(struct Qdisc *sch)
 		iphead = (struct iphdr *) data; // Now this is the location of our meta header
 
 		/* STATS */
-		if(likely(q->stat)){
-			agg_stat.aggtotbytes += skb->len; //skb->len = [macheader][metaheader][org_ip_header][payload]....
-            agg_stat.metaaggpkt++; //This counts the number of aggregated packets that are to be sent
-		    agg_stat.aggpackets++;  //This counts the number of packets that are to be aggregated
-		    agg_stat.aggbytes += (skb->len - MAC_LENGTH - sizeof(struct iphdr)); // sizeof(org_ip_header + payload)
-        }
+		agg_stat.aggtotbytes += skb->len; //skb->len = [macheader][metaheader][org_ip_header][payload]....
+        agg_stat.metaaggpkt++; //This counts the number of aggregated packets that are to be sent
+		agg_stat.aggpackets++;  //This counts the number of packets that are to be aggregated
+		agg_stat.aggbytes += (skb->len - MAC_LENGTH - sizeof(struct iphdr)); // sizeof(org_ip_header + payload)
+        
         while(skb->end - skb->tail >= node->skb_head.next->len - MAC_LENGTH){
             temp = __skb_dequeue(&node->skb_head);
 			if(temp == NULL)
@@ -451,11 +473,12 @@ static struct sk_buff *aggregate_dequeue(struct Qdisc *sch)
 			tot_len = tot_len + temp->len - MAC_LENGTH;
 
             /* STATS */
-            if(likely(q->stat)){
-                agg_stat.aggpackets++;
-                agg_stat.aggbytes += (temp->len - MAC_LENGTH);
-                agg_stat.aggtotbytes += (temp->len - MAC_LENGTH);  
-            }
+			sch->q.qlen--;
+			sch->qstats.backlog -= temp->len; 
+            agg_stat.aggpackets++;
+            agg_stat.aggbytes += (temp->len - MAC_LENGTH);
+            agg_stat.aggtotbytes += (temp->len - MAC_LENGTH);  
+            
             kfree_skb(temp);
            
 		}
@@ -489,9 +512,15 @@ static unsigned int aggregate_queue_drop(struct Qdisc *sch)
 static void aggregate_reset(struct Qdisc *sch){
 
  	struct aggregate_sched_data *q = qdisc_priv(sch);
+	qdisc_watchdog_cancel(&q->watchdog);
 	agg_destroy(&q->agg_queue_hdr);
     agg_stat_init(&agg_stat);
     q->agg_queue_hdr = NULL;
+
+	sch->q.qlen = 0;
+	sch->qstats.backlog = 0; 
+//	sch->bstats.bytes = 0; 
+//	sch->bstats.packets= 0;
 
 }
 
@@ -500,6 +529,7 @@ static int aggregate_dump(struct Qdisc *sch, struct sk_buff *skb)
 {
 	return -1;
 }
+
 
 struct Qdisc_ops aggregate_qdisc_ops = {
 	.next 		=	NULL,
@@ -511,6 +541,7 @@ struct Qdisc_ops aggregate_qdisc_ops = {
 	.drop		=	aggregate_queue_drop,
 	.init		=	agg_init,
 	.reset		=	aggregate_reset,
+	.destroy    =   aggregate_reset,
 	.change		=	aggregate_change,
 	.dump		=	aggregate_dump,
 	.owner		=	THIS_MODULE,
