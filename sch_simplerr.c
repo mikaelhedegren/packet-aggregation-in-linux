@@ -90,7 +90,10 @@ static int rr_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	struct rr_sched_data *q = qdisc_priv(sch);
 	int len = skb->len;
 	int ret;
-	if(skb->mark == MARK){
+	unsigned int aggMark = 0;
+	aggMark = ((unsigned int) skb ->mark & MARK_MASK);
+
+	if(aggMark == MARK_MASK){
 
 		ret = q->qAgg->enqueue(skb, q->qAgg);
 	}
@@ -100,6 +103,7 @@ static int rr_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	}
 	if(ret == NET_XMIT_SUCCESS){
 		sch->q.qlen++;
+		sch->qstats.backlog += len;
 		sch->bstats.packets++;
 		sch->bstats.bytes+=len;
 		return ret;
@@ -113,22 +117,43 @@ static struct sk_buff *rr_dequeue(struct Qdisc *sch)
 {
 	struct rr_sched_data *q = qdisc_priv(sch);
 	struct sk_buff *skb;
+	int agg_backlog = 0;
+	int agg_qlen = 0;
+
 	if(q->turn == 0){
 		q->turn = 1;
 
 		skb = q->qFifo->dequeue(q->qFifo);
-		if(skb == NULL)
+		if(skb == NULL){
+			agg_backlog = q->qAgg->qstats.backlog;
+			agg_qlen = q->qAgg->q.qlen;
 			skb = q->qAgg->dequeue(q->qAgg);				
+			if(skb){
+				sch->qstats.backlog = sch->qstats.backlog - (agg_backlog - q->qAgg->qstats.backlog);					
+				sch->q.qlen = sch->q.qlen - (agg_qlen - q->qAgg->q.qlen);			
+			}
+		}
+		else{
+			sch->qstats.backlog -= skb->len;		
+			sch->q.qlen--;
+		}
 	}
 	else{
 		q->turn = 0;
-
+		agg_backlog = q->qAgg->qstats.backlog;
+		agg_qlen = q->qAgg->q.qlen;
 		skb = q->qAgg->dequeue(q->qAgg);
-		if(skb == NULL)
+		if(skb == NULL){
 			skb = q->qFifo->dequeue(q->qFifo);
-	}
-	if(skb){
-		sch->q.qlen--;
+			if(skb){
+				sch->qstats.backlog -= skb->len;
+				sch->q.qlen--; //YES!
+			}
+		}
+		else{
+			sch->q.qlen = sch->q.qlen - (agg_qlen - q->qAgg->q.qlen);			
+			sch->qstats.backlog = sch->qstats.backlog - (agg_backlog - q->qAgg->qstats.backlog);					
+		}
 	}
 
 	return skb;
@@ -144,12 +169,12 @@ static int rr_requeue(struct sk_buff *skb, struct Qdisc *sch)
 						 so we let the fifo queue handle it from here */
 	
 	if(ret == 0){
-		sch->q.qlen++;
+		//sch->q.qlen++;
 		sch->qstats.requeues++;
 		return ret;
 	}
 
-	sch->q.qlen++;
+	//sch->q.qlen++;
 	sch->qstats.drops++;
 	return ret;
 }	
