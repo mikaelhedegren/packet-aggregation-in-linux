@@ -42,6 +42,7 @@
 #endif
 
 #define MARK 6003
+#define MARK_MASK 3
 #define RR_VER "20080122"
 #define AGG_MAX_LENGTH 1500
 #define TIME_PAD 50
